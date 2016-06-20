@@ -6,16 +6,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"text/template"
 
 	"github.com/constabulary/gb"
 	"github.com/constabulary/gb/cmd"
+	"github.com/pkg/errors"
 )
 
 var (
-	projectroot string
 	format      string
 	formatStdin bool
 	jsonOutput  bool
@@ -26,9 +27,10 @@ func init() {
 		Name:      "list",
 		UsageLine: `list [-s] [-f format] [-json] [packages]`,
 		Short:     "list the packages named by the importpaths",
-		Long: `list lists packages.
+		Long: `
+List lists packages imported by the project.
 
-The default output shows the package import path:
+The default output shows the package import paths:
 
 	% gb list github.com/constabulary/...
 	github.com/constabulary/gb
@@ -42,8 +44,13 @@ Flags:
 		alternate format for the list, using the syntax of package template.
 		The default output is equivalent to -f '{{.ImportPath}}'. The struct
 		being passed to the template is currently an instance of gb.Package.
-		This structure is under active development and it'As contents are not
-		guarenteed to be stable.
+		This structure is under active development and it's contents are not
+		guaranteed to be stable.
+	-s
+		read format template from STDIN.
+	-json
+		prints output in structured JSON format. WARNING: gb.Package
+		structure is not stable and will change in the future!
 `,
 		Run: list,
 		AddFlags: func(fs *flag.FlagSet) {
@@ -60,9 +67,9 @@ func list(ctx *gb.Context, args []string) error {
 		io.Copy(&formatBuffer, os.Stdin)
 		format = formatBuffer.String()
 	}
-	pkgs, err := cmd.ResolvePackages(ctx, args...)
+	pkgs, err := resolveRootPackages(ctx, args...)
 	if err != nil {
-		gb.Fatalf("unable to resolve: %v", err)
+		log.Fatalf("unable to resolve: %v", err)
 	}
 
 	if jsonOutput {
@@ -72,7 +79,7 @@ func list(ctx *gb.Context, args []string) error {
 		}
 		encoder := json.NewEncoder(os.Stdout)
 		if err := encoder.Encode(views); err != nil {
-			return fmt.Errorf("Error occurred during json encoding: %v", err)
+			return errors.Wrap(err, "json encoding failed")
 		}
 	} else {
 		fm := template.FuncMap{
@@ -80,12 +87,12 @@ func list(ctx *gb.Context, args []string) error {
 		}
 		tmpl, err := template.New("list").Funcs(fm).Parse(format)
 		if err != nil {
-			return fmt.Errorf("unable to parse template %q: %v", format, err)
+			return errors.Wrapf(err, "unable to parse template %q", format)
 		}
 
 		for _, pkg := range pkgs {
 			if err := tmpl.Execute(os.Stdout, pkg); err != nil {
-				return fmt.Errorf("unable to execute template: %v", err)
+				return errors.Wrap(err, "unable to execute template")
 			}
 			fmt.Fprintln(os.Stdout)
 		}

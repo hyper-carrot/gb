@@ -3,11 +3,12 @@ package cmd
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/constabulary/gb"
+	"github.com/constabulary/gb/internal/debug"
+	"github.com/pkg/errors"
 )
 
 // Command represents a subcommand, or plugin that is executed within
@@ -35,10 +36,8 @@ type Command struct {
 	// Allow plugins to modify arguments
 	FlagParse func(fs *flag.FlagSet, args []string) error
 
-	// ParseArgs provides an alternative method to parse arguments.
-	// By default, arguments will be parsed as import paths with
-	// ImportPaths
-	ParseArgs func(ctx *gb.Context, cwd string, args []string) []string
+	// SkipParseArgs avoids parsing arguments as import paths.
+	SkipParseArgs bool
 }
 
 // Runnable indicates this is a command that can be involved.
@@ -61,33 +60,29 @@ func RunCommand(fs *flag.FlagSet, cmd *Command, projectroot, goroot string, args
 
 	ctx, err := NewContext(projectroot, gb.GcToolchain())
 	if err != nil {
-		return fmt.Errorf("unable to construct context: %v", err)
+		return errors.Wrap(err, "unable to construct context")
 	}
 	defer ctx.Destroy()
 
-	gb.Debugf("args: %v", args)
+	debug.Debugf("args: %v", args)
 	return cmd.Run(ctx, args)
 }
 
 // NewContext creates a gb.Context for the project root.
 func NewContext(projectroot string, options ...func(*gb.Context) error) (*gb.Context, error) {
 	if projectroot == "" {
-		return nil, fmt.Errorf("project root is blank")
+		return nil, errors.New("project root is blank")
 	}
 
 	root, err := FindProjectroot(projectroot)
 	if err != nil {
-		return nil, fmt.Errorf("could not locate project root: %v", err)
+		return nil, errors.Wrap(err, "could not locate project root")
 	}
 	project := gb.NewProject(root,
 		gb.SourceDir(filepath.Join(root, "src")),
 		gb.SourceDir(filepath.Join(root, "vendor", "src")),
 	)
 
-	gb.Debugf("project root %q", project.Projectdir())
+	debug.Debugf("project root %q", project.Projectdir())
 	return project.NewContext(options...)
-}
-
-func mkdir(path string) error {
-	return os.MkdirAll(path, 0755)
 }

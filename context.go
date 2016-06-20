@@ -1,24 +1,34 @@
 package gb
 
 import (
-	"bytes"
 	"fmt"
-	"go/build"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/constabulary/gb/internal/debug"
+	"github.com/constabulary/gb/internal/importer"
+	"github.com/pkg/errors"
 )
 
 // Context represents an execution of one or more Targets inside a Project.
 type Context struct {
 	*Project
-	Context *build.Context
+
+	importers []interface {
+		Import(path string) (*importer.Package, error)
+	}
+
+	pkgs map[string]*Package // map of package paths to resolved packages
+
 	workdir string
 
 	tc Toolchain
@@ -28,20 +38,25 @@ type Context struct {
 
 	Statistics
 
-	Force       bool // force rebuild of packages
-	SkipInstall bool // do not cache compiled packages
-
-	pkgs map[string]*Package // map of package paths to resolved packages
+	Force   bool // force rebuild of packages
+	Install bool // copy packages into $PROJECT/pkg
+	Verbose bool // verbose output
+	Nope    bool // command specfic flag, under test it skips the execute action.
+	race    bool // race detector requested
 
 	gcflags []string // flags passed to the compiler
 	ldflags []string // flags passed to the linker
+
+	linkmode, buildmode string // link and build modes
+
+	buildtags []string // build tags
 }
 
 // GOOS configures the Context to use goos as the target os.
 func GOOS(goos string) func(*Context) error {
 	return func(c *Context) error {
 		if goos == "" {
-			return fmt.Errorf("goos cannot be blank")
+			return fmt.Errorf("GOOS cannot be blank")
 		}
 		c.gotargetos = goos
 		return nil
@@ -52,11 +67,45 @@ func GOOS(goos string) func(*Context) error {
 func GOARCH(goarch string) func(*Context) error {
 	return func(c *Context) error {
 		if goarch == "" {
-			return fmt.Errorf("goarch cannot be blank")
+			return fmt.Errorf("GOARCH cannot be blank")
 		}
 		c.gotargetarch = goarch
 		return nil
 	}
+}
+
+// Tags configured the context to use these additional build tags
+func Tags(tags ...string) func(*Context) error {
+	return func(c *Context) error {
+		c.buildtags = append(c.buildtags, tags...)
+		return nil
+	}
+}
+
+// Gcflags appends flags to the list passed to the compiler.
+func Gcflags(flags ...string) func(*Context) error {
+	return func(c *Context) error {
+		c.gcflags = append(c.gcflags, flags...)
+		return nil
+	}
+}
+
+// Ldflags appends flags to the list passed to the linker.
+func Ldflags(flags ...string) func(*Context) error {
+	return func(c *Context) error {
+		c.ldflags = append(c.ldflags, flags...)
+		return nil
+	}
+}
+
+// WithRace enables the race detector and adds the tag "race" to
+// the Context build tags.
+func WithRace(c *Context) error {
+	c.race = true
+	Tags("race")(c)
+	Gcflags("-race")(c)
+	Ldflags("-race")(c)
+	return nil
 }
 
 // NewContext returns a new build context from this project.
@@ -64,7 +113,7 @@ func GOARCH(goarch string) func(*Context) error {
 // host's GOOS and GOARCH values.
 func (p *Project) NewContext(opts ...func(*Context) error) (*Context, error) {
 	if len(p.srcdirs) == 0 {
-		return nil, fmt.Errorf("no source directories supplied")
+		return nil, errors.New("no source directories supplied")
 	}
 	envOr := func(key, def string) string {
 		if v := os.Getenv(key); v != "" {
@@ -85,10 +134,16 @@ func (p *Project) NewContext(opts ...func(*Context) error) (*Context, error) {
 		},
 		GcToolchain(),
 	}
+	workdir, err := ioutil.TempDir("", "gb")
+	if err != nil {
+		return nil, err
+	}
+
 	ctx := Context{
-		Project: p,
-		workdir: mktmpdir(),
-		pkgs:    make(map[string]*Package),
+		Project:   p,
+		workdir:   workdir,
+		buildmode: "exe",
+		pkgs:      make(map[string]*Package),
 	}
 
 	for _, opt := range append(defaults, opts...) {
@@ -98,38 +153,49 @@ func (p *Project) NewContext(opts ...func(*Context) error) (*Context, error) {
 		}
 	}
 
-	// backfill enbedded go/build.Context
-	ctx.Context = &build.Context{
-		GOOS:     ctx.gotargetos,
-		GOARCH:   ctx.gotargetarch,
-		GOROOT:   runtime.GOROOT(),
-		GOPATH:   togopath(p.Srcdirs()),
-		Compiler: runtime.Compiler, // TODO(dfc) probably unused
+	// sort build tags to ensure the ctxSring and Suffix is stable
+	sort.Strings(ctx.buildtags)
 
-		// Make sure we use the same set of release tags as go/build
-		ReleaseTags: build.Default.ReleaseTags,
-
-		CgoEnabled: build.Default.CgoEnabled,
+	ic := importer.Context{
+		GOOS:        ctx.gotargetos,
+		GOARCH:      ctx.gotargetarch,
+		CgoEnabled:  cgoEnabled(ctx.gohostos, ctx.gohostarch, ctx.gotargetos, ctx.gotargetarch),
+		ReleaseTags: releaseTags, // from go/build, see gb.go
+		BuildTags:   ctx.buildtags,
 	}
+
+	ctx.importers = append(ctx.importers,
+		&importer.Importer{
+			Context: &ic,
+			Root:    runtime.GOROOT(),
+		},
+	)
+
+	for _, dir := range p.Srcdirs() {
+		ctx.importers = append(ctx.importers,
+			&importer.Importer{
+				Context: &ic,
+				Root:    filepath.Dir(dir), // strip off "src"
+			})
+	}
+
+	// C and unsafe are fake packages synthesised by the compiler.
+	// Insert fake packages into the package cache.
+	for _, name := range []string{"C", "unsafe"} {
+		pkg, err := newPackage(&ctx, &importer.Package{
+			Name:       name,
+			ImportPath: name,
+			Standard:   true,
+			Dir:        name, // fake, but helps diagnostics
+		})
+		if err != nil {
+			return nil, err
+		}
+		pkg.Stale = false
+		ctx.pkgs[pkg.ImportPath] = pkg
+	}
+
 	return &ctx, nil
-}
-
-// Gcflags sets options passed to the compiler.
-func Gcflags(flags string) func(*Context) error {
-	return func(c *Context) error {
-		var err error
-		c.gcflags, err = splitQuotedFields(flags)
-		return err
-	}
-}
-
-// Ldflags sets options passed to the linker.
-func Ldflags(flags string) func(*Context) error {
-	return func(c *Context) error {
-		var err error
-		c.ldflags, err = splitQuotedFields(flags)
-		return err
-	}
 }
 
 // IncludePaths returns the include paths visible in this context.
@@ -140,9 +206,29 @@ func (c *Context) IncludePaths() []string {
 	}
 }
 
+// NewPackage creates a resolved Package for p.
+func (c *Context) NewPackage(p *importer.Package) (*Package, error) {
+	pkg, err := newPackage(c, p)
+	if err != nil {
+		return nil, err
+	}
+	pkg.Stale = isStale(pkg)
+	return pkg, nil
+}
+
 // Pkgdir returns the path to precompiled packages.
 func (c *Context) Pkgdir() string {
 	return filepath.Join(c.Project.Pkgdir(), c.ctxString())
+}
+
+// Suffix returns the suffix (if any) for binaries produced
+// by this context.
+func (c *Context) Suffix() string {
+	suffix := c.ctxString()
+	if suffix != "" {
+		suffix = "-" + suffix
+	}
+	return suffix
 }
 
 // Workdir returns the path to this Context's working directory.
@@ -150,32 +236,88 @@ func (c *Context) Workdir() string { return c.workdir }
 
 // ResolvePackage resolves the package at path using the current context.
 func (c *Context) ResolvePackage(path string) (*Package, error) {
-	return loadPackage(c, nil, path)
-}
-
-// ResolvePackageWithTests resolves the package at path using the current context
-// it also resolves the internal and external test dependenices, although these are
-// not returned, only cached in the Context.
-func (c *Context) ResolvePackageWithTests(path string) (*Package, error) {
-	p, err := c.ResolvePackage(path)
+	if path == "." {
+		return nil, errors.Errorf("%q is not a package", filepath.Join(c.rootdir, "src"))
+	}
+	path, err := relImportPath(filepath.Join(c.rootdir, "src"), path)
 	if err != nil {
 		return nil, err
 	}
-	var imports []string
-	imports = append(imports, p.Package.TestImports...)
-	imports = append(imports, p.Package.XTestImports...)
-	for _, i := range imports {
-		_, err := c.ResolvePackage(i)
+	if path == "." || path == ".." || strings.HasPrefix(path, "./") || strings.HasPrefix(path, "../") {
+		return nil, errors.Errorf("import %q: relative import not supported", path)
+	}
+	return c.loadPackage(nil, path)
+}
+
+// loadPackage recursively resolves path as a package. If successful loadPackage
+// records the package in the Context's internal package cache.
+func (c *Context) loadPackage(stack []string, path string) (*Package, error) {
+	if pkg, ok := c.pkgs[path]; ok {
+		// already loaded, just return
+		return pkg, nil
+	}
+
+	p, err := c.importPackage(path)
+	if err != nil {
+		return nil, err
+	}
+
+	stack = append(stack, p.ImportPath)
+	var stale bool
+	for i, im := range p.Imports {
+		for _, p := range stack {
+			if p == im {
+				return nil, fmt.Errorf("import cycle detected: %s", strings.Join(append(stack, im), " -> "))
+			}
+		}
+		pkg, err := c.loadPackage(stack, im)
 		if err != nil {
 			return nil, err
 		}
+
+		// update the import path as the import may have been discovered via vendoring.
+		p.Imports[i] = pkg.ImportPath
+		stale = stale || pkg.Stale
 	}
-	return p, nil
+
+	pkg, err := newPackage(c, p)
+	if err != nil {
+		return nil, errors.Wrapf(err, "loadPackage(%q)", path)
+	}
+	pkg.Stale = stale || isStale(pkg)
+	c.pkgs[p.ImportPath] = pkg
+	return pkg, nil
+}
+
+// importPackage loads a package using the backing set of importers.
+func (c *Context) importPackage(path string) (*importer.Package, error) {
+	pkg, err := c.importers[0].Import(path)
+	if err == nil {
+		return pkg, nil
+	}
+	pkg, err2 := c.importers[1].Import(path)
+	if err2 == nil {
+		return pkg, nil
+	}
+	if len(c.importers) > 2 {
+		pkg, err3 := c.importers[2].Import(path)
+		if err3 == nil {
+			return pkg, nil
+		}
+	}
+	switch err2.(type) {
+	case *importer.NoGoError:
+		return nil, err2
+	case *os.PathError:
+		return nil, errors.Wrapf(err2, "import %q: not found", path)
+	default:
+		return nil, err2
+	}
 }
 
 // Destroy removes the temporary working files of this context.
 func (c *Context) Destroy() error {
-	Debugf("removing work directory: %v", c.workdir)
+	debug.Debugf("removing work directory: %v", c.workdir)
 	return os.RemoveAll(c.workdir)
 }
 
@@ -186,16 +328,8 @@ func (c *Context) ctxString() string {
 		c.gotargetos,
 		c.gotargetarch,
 	}
+	v = append(v, c.buildtags...)
 	return strings.Join(v, "-")
-}
-
-func run(dir string, env []string, command string, args ...string) error {
-	var buf bytes.Buffer
-	err := runOut(&buf, dir, env, command, args...)
-	if err != nil {
-		return fmt.Errorf("# %s %s: %v\n%s", command, strings.Join(args, " "), err, buf.String())
-	}
-	return nil
 }
 
 func runOut(output io.Writer, dir string, env []string, command string, args ...string) error {
@@ -204,7 +338,7 @@ func runOut(output io.Writer, dir string, env []string, command string, args ...
 	cmd.Stdout = output
 	cmd.Stderr = os.Stderr
 	cmd.Env = mergeEnvLists(env, envForDir(cmd.Dir))
-	Debugf("cd %s; %s", cmd.Dir, cmd.Args)
+	debug.Debugf("cd %s; %s", cmd.Dir, cmd.Args)
 	err := cmd.Run()
 	return err
 }
@@ -290,24 +424,16 @@ func treeCanMatchPattern(pattern string) func(name string) bool {
 
 // AllPackages returns all the packages that can be found under the $PROJECT/src directory.
 // The pattern is a path including "...".
-func (c *Context) AllPackages(pattern string) []string {
+func (c *Context) AllPackages(pattern string) ([]string, error) {
 	return matchPackages(c, pattern)
-}
-
-// shouldignore tests if the package should be ignored.
-func (c *Context) shouldignore(p string) bool {
-	if c.isCrossCompile() {
-		return p == "C" || p == "unsafe"
-	}
-	return stdlib[p]
 }
 
 func (c *Context) isCrossCompile() bool {
 	return c.gohostos != c.gotargetos || c.gohostarch != c.gotargetarch
 }
 
-func matchPackages(c *Context, pattern string) []string {
-	Debugf("matchPackages: %v %v", c.srcdirs[0].Root, pattern)
+func matchPackages(c *Context, pattern string) ([]string, error) {
+	debug.Debugf("matchPackages: %v", pattern)
 	match := func(string) bool { return true }
 	treeCanMatch := func(string) bool { return true }
 	if pattern != "all" && pattern != "std" {
@@ -317,40 +443,40 @@ func matchPackages(c *Context, pattern string) []string {
 
 	var pkgs []string
 
-	for _, dir := range c.srcdirs[:1] {
-		src := filepath.Clean(dir.Root) + string(filepath.Separator)
-		filepath.Walk(src, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || !fi.IsDir() || path == src {
-				return nil
-			}
+	src := filepath.Join(c.Projectdir(), "src") + string(filepath.Separator)
+	err := filepath.Walk(src, func(path string, fi os.FileInfo, err error) error {
+		if err != nil || !fi.IsDir() || path == src {
+			return nil
+		}
 
-			// Avoid .foo, _foo, and testdata directory trees.
-			_, elem := filepath.Split(path)
-			if strings.HasPrefix(elem, ".") || strings.HasPrefix(elem, "_") || elem == "testdata" {
-				return filepath.SkipDir
-			}
+		// Avoid .foo, _foo, and testdata directory trees.
+		elem := fi.Name()
+		if strings.HasPrefix(elem, ".") || strings.HasPrefix(elem, "_") || elem == "testdata" {
+			return filepath.SkipDir
+		}
 
-			name := filepath.ToSlash(path[len(src):])
-			if pattern == "std" && strings.Contains(name, ".") {
-				return filepath.SkipDir
-			}
-			if !treeCanMatch(name) {
-				return filepath.SkipDir
-			}
-			if !match(name) {
-				return nil
-			}
-			_, err = c.Context.Import(".", path, 0)
-			if err != nil {
-				if _, noGo := err.(*build.NoGoError); noGo {
-					return nil
-				}
-			}
+		name := filepath.ToSlash(path[len(src):])
+		if pattern == "std" && strings.Contains(name, ".") {
+			return filepath.SkipDir
+		}
+		if !treeCanMatch(name) {
+			return filepath.SkipDir
+		}
+		if !match(name) {
+			return nil
+		}
+		_, err = c.importers[1].Import(name)
+		switch err.(type) {
+		case nil:
 			pkgs = append(pkgs, name)
 			return nil
-		})
-	}
-	return pkgs
+		case *importer.NoGoError:
+			return nil // skip
+		default:
+			return err
+		}
+	})
+	return pkgs, err
 }
 
 // envForDir returns a copy of the environment
@@ -380,4 +506,40 @@ NextVar:
 		out = append(out, inkv)
 	}
 	return out
+}
+
+func cgoEnabled(gohostos, gohostarch, gotargetos, gotargetarch string) bool {
+	switch os.Getenv("CGO_ENABLED") {
+	case "1":
+		return true
+	case "0":
+		return false
+	default:
+		// cgo must be explicitly enabled for cross compilation builds
+		if gohostos == gotargetos && gohostarch == gotargetarch {
+			switch gotargetos + "/" + gotargetarch {
+			case "darwin/386", "darwin/amd64", "darwin/arm", "darwin/arm64":
+				return true
+			case "dragonfly/amd64":
+				return true
+			case "freebsd/386", "freebsd/amd64", "freebsd/arm":
+				return true
+			case "linux/386", "linux/amd64", "linux/arm", "linux/arm64", "linux/ppc64le":
+				return true
+			case "android/386", "android/amd64", "android/arm":
+				return true
+			case "netbsd/386", "netbsd/amd64", "netbsd/arm":
+				return true
+			case "openbsd/386", "openbsd/amd64":
+				return true
+			case "solaris/amd64":
+				return true
+			case "windows/386", "windows/amd64":
+				return true
+			default:
+				return false
+			}
+		}
+		return false
+	}
 }

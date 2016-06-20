@@ -1,6 +1,11 @@
 # gb
 
-[![wercker status](https://app.wercker.com/status/494a8ac6b836f39cc7e67036d957a43e/m "wercker status")](https://app.wercker.com/project/bykey/494a8ac6b836f39cc7e67036d957a43e)
+### Build status
+Unix:
+[![travis-cs status](https://travis-ci.org/constabulary/gb.svg "travis-ci status")](https://travis-ci.org/constabulary/gb)
+
+Windows:
+[![Build status](https://ci.appveyor.com/api/projects/status/rjttg1agmp2sra3h/branch/master?svg=true)](https://ci.appveyor.com/project/davecheney/gb/branch/master)
 
 `gb` is a proof of concept replacement build tool for the [Go programming language](https://golang.org).
 
@@ -24,24 +29,29 @@ gb has its own site, [getgb.io](http://getgb.io/), head over there for more info
 
 ## Contributing
 
+### Contribution guidelines
+
+We welcome pull requests, bug fixes and issue reports.
+
+Before proposing a large change, please discuss your change by raising an issue.
+
 ### Road map
 
-In rough order
+#### Completed
 
 - [Cross Compilation](https://github.com/constabulary/gb/milestones/cross-compilation)
-- gb test improvements, test output, flag handling
-- gb vendor updates and bug fixes
-- new package resolver (replace go/build)
+- Tag handling, unify -tags, ENVVARS and GOOS/GOARCH into a single format for binary names and pkg cache
+- gb test improvements, test output, test flag handling
+- [Race detector support](https://github.com/constabulary/gb/issues/96)
+
+#### Todo
+
+- 0.4 series: gb vendor updates and bug fixes
+- 0.5 series: new package resolver (replace go/build)
 
 ### Big ticket items 
 
 Big ticket items that are not on the road map yet
 
-- [Race detector support](https://github.com/constabulary/gb/issues/96)
-- Tag handling, unify -tags, ENVVARS and GOOS/GOARCH into a single format for binary names and pkg cache
 - Package BuildID support (make stale detection work like the Go 1.5)
 - `gccgo` toolchain support.
-
-We welcome pull requests, bug fixes and issue reports.
-
-Before proposing a large change, please discuss your change by raising an issue.

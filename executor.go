@@ -2,6 +2,8 @@ package gb
 
 import (
 	"sync"
+
+	"github.com/pkg/errors"
 )
 
 // Execute executes a tree of *Actions sequentually in depth first order.
@@ -31,7 +33,7 @@ func execute(seen map[*Action]error, a *Action) error {
 
 // ExecuteConcurrent executes all actions in a tree concurrently.
 // Each Action will wait until its dependant actions are complete.
-func ExecuteConcurrent(a *Action, n int) error {
+func ExecuteConcurrent(a *Action, n int, interrupt <-chan struct{}) error {
 	var mu sync.Mutex // protects seen
 	seen := make(map[*Action]chan error)
 
@@ -83,9 +85,14 @@ func ExecuteConcurrent(a *Action, n int) error {
 				}
 			}
 			// wait for a permit and execute our action
-			<-permits
-			result <- a.Run()
-			permits <- true
+			select {
+			case <-permits:
+				result <- a.Run()
+				permits <- true
+			case <-interrupt:
+				result <- errors.New("interrupted")
+				return
+			}
 		}()
 
 		return result

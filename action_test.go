@@ -6,19 +6,7 @@ import (
 	"testing"
 )
 
-// assert that anonymous and named functions can be
-// converted to a Task via TaskFn
-
-func f() error { return nil }
-
-var _ Task = TaskFn(func() error { return nil })
-var _ Task = TaskFn(f)
-
 func TestBuildAction(t *testing.T) {
-	actions := func(a ...*Action) []*Action {
-		return a
-	}
-
 	var tests = []struct {
 		pkg    string
 		action *Action
@@ -27,7 +15,7 @@ func TestBuildAction(t *testing.T) {
 		pkg: "a",
 		action: &Action{
 			Name: "build: a",
-			Deps: actions(&Action{Name: "compile: a"}),
+			Deps: []*Action{&Action{Name: "compile: a"}},
 		},
 	}, {
 		pkg: "b",
@@ -67,7 +55,7 @@ func TestBuildAction(t *testing.T) {
 		ctx := testContext(t)
 		defer ctx.Destroy()
 		pkg, err := ctx.ResolvePackage(tt.pkg)
-		if !sameErr(err, tt.err) {
+		if !reflect.DeepEqual(err, tt.err) {
 			t.Errorf("ctx.ResolvePackage(%v): want %v, got %v", tt.pkg, tt.err, err)
 			continue
 		}
@@ -75,14 +63,14 @@ func TestBuildAction(t *testing.T) {
 			continue
 		}
 		got, err := BuildPackages(pkg)
-		if !sameErr(err, tt.err) {
+		if !reflect.DeepEqual(err, tt.err) {
 			t.Errorf("BuildAction(%v): want %v, got %v", tt.pkg, tt.err, err)
 			continue
 		}
 		deleteTasks(got)
 
 		if !reflect.DeepEqual(tt.action, got) {
-			t.Errorf("BuildAction(%v): want %#v, got %#v", tt.pkg, tt.action, got)
+			t.Errorf("BuildAction(%v): want %#+v, got %#+v", tt.pkg, tt.action, got)
 		}
 
 		// double underpants
@@ -125,5 +113,5 @@ func deleteTasks(a *Action) {
 	for _, d := range a.Deps {
 		deleteTasks(d)
 	}
-	a.Task = nil
+	a.Run = nil
 }

@@ -8,7 +8,7 @@ import (
 
 	"github.com/constabulary/gb"
 	"github.com/constabulary/gb/cmd"
-	"github.com/constabulary/gb/vendor"
+	"github.com/constabulary/gb/internal/vendor"
 )
 
 func init() {
@@ -59,14 +59,6 @@ func depset(ctx *gb.Context, args []string) error {
 	}
 
 	return nil
-}
-
-func keys(m map[string]bool) []string {
-	var s []string
-	for k := range m {
-		s = append(s, k)
-	}
-	return s
 }
 
 func pkgs(m map[string]*vendor.Pkg) []*vendor.Pkg {

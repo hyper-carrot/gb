@@ -7,7 +7,9 @@ import (
 
 	"github.com/constabulary/gb"
 	"github.com/constabulary/gb/cmd"
-	"github.com/constabulary/gb/vendor"
+	"github.com/constabulary/gb/internal/fileutils"
+	"github.com/constabulary/gb/internal/vendor"
+	"github.com/pkg/errors"
 )
 
 func addRestoreFlags(fs *flag.FlagSet) {
@@ -18,9 +20,10 @@ var cmdRestore = &cmd.Command{
 	Name:      "restore",
 	UsageLine: "restore [-precaire]",
 	Short:     "restore dependencies from the manifest",
-	Long: `Restore vendor dependecies.
+	Long: `Restore vendor dependencies.
 
 Flags:
+	-precaire
 		allow the use of insecure protocols.
 
 `,
@@ -33,23 +36,23 @@ Flags:
 func restore(ctx *gb.Context) error {
 	m, err := vendor.ReadManifest(manifestFile(ctx))
 	if err != nil {
-		return fmt.Errorf("could not load manifest: %v", err)
+		return errors.Wrap(err, "could not load manifest")
 	}
 
 	for _, dep := range m.Dependencies {
 		fmt.Printf("Getting %s\n", dep.Importpath)
 		repo, _, err := vendor.DeduceRemoteRepo(dep.Importpath, insecure)
 		if err != nil {
-			return fmt.Errorf("Could not process dependency: %s", err)
+			return errors.Wrap(err, "could not process dependency")
 		}
 		wc, err := repo.Checkout("", "", dep.Revision)
 		if err != nil {
-			return fmt.Errorf("Could not retrieve dependency: %s", err)
+			return errors.Wrap(err, "could not retrieve dependency")
 		}
 		dst := filepath.Join(ctx.Projectdir(), "vendor", "src", dep.Importpath)
 		src := filepath.Join(wc.Dir(), dep.Path)
 
-		if err := vendor.Copypath(dst, src); err != nil {
+		if err := fileutils.Copypath(dst, src); err != nil {
 			return err
 		}
 

@@ -119,9 +119,10 @@ Usage:
 
         gb vendor restore [-precaire]
 
-Restore vendor dependecies.
+Restore vendor dependencies.
 
 Flags:
+	-precaire
 		allow the use of insecure protocols.
 
 

@@ -2,52 +2,47 @@ package gb
 
 import (
 	"fmt"
-	"go/build"
+	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/constabulary/gb/internal/importer"
+	"github.com/pkg/errors"
 )
 
 // Package represents a resolved package from the Project with respect to the Context.
 type Package struct {
 	*Context
-	*build.Package
-	Scope         string // scope: build, test, etc
+	*importer.Package
+	TestScope     bool
 	ExtraIncludes string // hook for test
 	Stale         bool   // is the package out of date wrt. its cached copy
-	Standard      bool   // is this package part of the standard library
+	Imports       []*Package
 }
 
-// NewPackage creates a resolved Package.
-func NewPackage(ctx *Context, p *build.Package) *Package {
-	pkg := Package{
+// newPackage creates a resolved Package without setting pkg.Stale.
+func newPackage(ctx *Context, p *importer.Package) (*Package, error) {
+	pkg := &Package{
 		Context: ctx,
 		Package: p,
 	}
-	// seed pkg.c so calling result never blocks
-	pkg.Stale = isStale(&pkg)
-	return &pkg
-}
-
-// isMain returns true if this is a command, a main package.
-func (p *Package) isMain() bool {
-	return p.Name == "main" || strings.HasSuffix(p.ImportPath, "testmain") && p.Scope == "test"
-}
-
-// Imports returns the Pacakges that this Package depends on.
-func (p *Package) Imports() []*Package {
-	pkgs := make([]*Package, 0, len(p.Package.Imports))
-	for _, i := range p.Package.Imports {
-		if p.shouldignore(i) {
-			continue
-		}
-
-		pkg, ok := p.pkgs[i]
+	for _, i := range p.Imports {
+		dep, ok := ctx.pkgs[i]
 		if !ok {
-			panic("could not locate package: " + i)
+			return nil, errors.Errorf("newPackage(%q): could not locate dependant package %q ", p.Name, i)
 		}
-		pkgs = append(pkgs, pkg)
+		pkg.Imports = append(pkg.Imports, dep)
 	}
-	return pkgs
+	return pkg, nil
+}
+
+// isMain returns true if this is a command, not being built in test scope, and
+// not the testmain itself.
+func (p *Package) isMain() bool {
+	if p.TestScope {
+		return strings.HasSuffix(p.ImportPath, "testmain")
+	}
+	return p.Name == "main"
 }
 
 func (p *Package) String() string {
@@ -74,103 +69,23 @@ func (p *Package) Complete() bool {
 	return extFiles == 0
 }
 
-// Objdir returns the destination for object files compiled for this Package.
-func (pkg *Package) Objdir() string {
-	switch pkg.Scope {
-	case "test":
-		ip := strings.TrimSuffix(filepath.FromSlash(pkg.ImportPath), "_test")
-		return filepath.Join(pkg.Workdir(), ip, "_test", filepath.Dir(filepath.FromSlash(pkg.ImportPath)))
-	default:
-		return filepath.Join(pkg.Workdir(), filepath.Dir(filepath.FromSlash(pkg.ImportPath)))
-	}
-}
-
 // Binfile returns the destination of the compiled target of this command.
 func (pkg *Package) Binfile() string {
 	// TODO(dfc) should have a check for package main, or should be merged in to objfile.
-	var target string
-	switch pkg.Scope {
-	case "test":
+	target := filepath.Join(pkg.Bindir(), binname(pkg))
+	if pkg.TestScope {
 		target = filepath.Join(pkg.Workdir(), filepath.FromSlash(pkg.ImportPath), "_test", binname(pkg))
-	default:
-		target = filepath.Join(pkg.Bindir(), binname(pkg))
 	}
 
-	// if this is a cross compile, add ctxString
-	if pkg.isCrossCompile() {
+	// if this is a cross compile or GOOS/GOARCH are both defined or there are build tags, add ctxString.
+	if pkg.isCrossCompile() || (os.Getenv("GOOS") != "" && os.Getenv("GOARCH") != "") {
 		target += "-" + pkg.ctxString()
+	} else if len(pkg.buildtags) > 0 {
+		target += "-" + strings.Join(pkg.buildtags, "-")
 	}
 
 	if pkg.gotargetos == "windows" {
 		target += ".exe"
 	}
 	return target
-}
-
-// loadPackage recursively resolves path and its imports and if successful
-// stores those packages in the Context's internal package cache.
-func loadPackage(c *Context, stack []string, path string) (*Package, error) {
-	if build.IsLocalImport(path) {
-		// sanity check
-		return nil, fmt.Errorf("%q is not a valid import path", path)
-	}
-	if pkg, ok := c.pkgs[path]; ok {
-		// already loaded, just return
-		return pkg, nil
-	}
-
-	push := func(path string) {
-		stack = append(stack, path)
-	}
-	pop := func(path string) {
-		stack = stack[:len(stack)-1]
-	}
-	onStack := func(path string) bool {
-		for _, p := range stack {
-			if p == path {
-				return true
-			}
-		}
-		return false
-	}
-
-	p, err := c.Context.Import(path, c.Projectdir(), 0)
-	if err != nil {
-		return nil, err
-	}
-
-	// everything depends on runtime, except the runtime itself.
-	// TODO(dfc) see if this can be made more selective by adding
-	// runtime as a dependency of some select packages.
-	standard := p.Goroot && p.ImportPath != "" && !strings.Contains(p.ImportPath, ".")
-	if standard && p.ImportPath != "runtime" {
-		p.Imports = append(p.Imports, "runtime")
-	}
-
-	push(path)
-	var stale bool
-	for _, i := range p.Imports {
-		if c.shouldignore(i) {
-			continue
-		}
-		if onStack(i) {
-			push(i)
-			return nil, fmt.Errorf("import cycle detected: %s", strings.Join(stack, " -> "))
-		}
-		pkg, err := loadPackage(c, stack, i)
-		if err != nil {
-			return nil, err
-		}
-		stale = stale || pkg.Stale
-	}
-	pop(path)
-
-	pkg := Package{
-		Context:  c,
-		Package:  p,
-		Standard: standard,
-	}
-	pkg.Stale = stale || isStale(&pkg)
-	c.pkgs[path] = &pkg
-	return &pkg, nil
 }

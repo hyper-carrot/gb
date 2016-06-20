@@ -1,11 +1,15 @@
 package gb
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/constabulary/gb/internal/debug"
+	"github.com/constabulary/gb/internal/fileutils"
 )
 
 // Build builds each of pkgs in succession. If pkg is a command, then the results of build include
@@ -15,17 +19,17 @@ func Build(pkgs ...*Package) error {
 	if err != nil {
 		return err
 	}
-	return ExecuteConcurrent(build, runtime.NumCPU())
+	return ExecuteConcurrent(build, runtime.NumCPU(), nil)
 }
 
-// BuildAction produces a tree of *Actions that can be executed to build
+// BuildPackages produces a tree of *Actions that can be executed to build
 // a *Package.
-// BuildAction walks the tree of *Packages and returns a corresponding
+// BuildPackages walks the tree of *Packages and returns a corresponding
 // tree of *Actions representing the steps required to build *Package
 // and any of its dependencies
 func BuildPackages(pkgs ...*Package) (*Action, error) {
 	if len(pkgs) < 1 {
-		return nil, fmt.Errorf("no packages supplied")
+		return nil, errors.New("no packages supplied")
 	}
 
 	targets := make(map[string]*Action) // maps package importpath to build action
@@ -42,15 +46,15 @@ func BuildPackages(pkgs ...*Package) (*Action, error) {
 	t0 := time.Now()
 	build := Action{
 		Name: fmt.Sprintf("build: %s", strings.Join(names(pkgs), ",")),
-		Task: TaskFn(func() error {
-			Debugf("build duration: %v %v", time.Since(t0), pkgs[0].Statistics.String())
+		Run: func() error {
+			debug.Debugf("build duration: %v %v", time.Since(t0), pkgs[0].Statistics.String())
 			return nil
-		}),
+		},
 	}
 
 	for _, pkg := range pkgs {
 		if len(pkg.GoFiles)+len(pkg.CgoFiles) == 0 {
-			Debugf("skipping %v: no go files", pkg.ImportPath)
+			debug.Debugf("skipping %v: no go files", pkg.ImportPath)
 			continue
 		}
 		a, err := BuildPackage(targets, pkg)
@@ -131,9 +135,7 @@ func Compile(pkg *Package, deps ...*Action) (*Action, error) {
 	compile := Action{
 		Name: fmt.Sprintf("compile: %s", pkg.ImportPath),
 		Deps: deps,
-		Task: TaskFn(func() error {
-			return gc(pkg, gofiles)
-		}),
+		Run:  func() error { return gc(pkg, gofiles) },
 	}
 
 	// step 3. are there any .s files to assemble.
@@ -143,16 +145,21 @@ func Compile(pkg *Package, deps ...*Action) (*Action, error) {
 		ofile := filepath.Join(pkg.Workdir(), pkg.ImportPath, stripext(sfile)+".6")
 		assemble = append(assemble, &Action{
 			Name: fmt.Sprintf("asm: %s/%s", pkg.ImportPath, sfile),
-			Task: TaskFn(func() error {
+			Run: func() error {
 				t0 := time.Now()
 				err := pkg.tc.Asm(pkg, pkg.Dir, ofile, filepath.Join(pkg.Dir, sfile))
 				pkg.Record("asm", time.Since(t0))
 				return err
-			}),
+			},
 			// asm depends on compile because compile will generate the local go_asm.h
 			Deps: []*Action{&compile},
 		})
 		ofiles = append(ofiles, ofile)
+	}
+
+	// step 4. add system object files.
+	for _, syso := range pkg.SysoFiles {
+		ofiles = append(ofiles, filepath.Join(pkg.Dir, syso))
 	}
 
 	build := &compile
@@ -164,7 +171,7 @@ func Compile(pkg *Package, deps ...*Action) (*Action, error) {
 			Deps: []*Action{
 				&compile,
 			},
-			Task: TaskFn(func() error {
+			Run: func() error {
 				// collect .o files, ofiles always starts with the gc compiled object.
 				// TODO(dfc) objfile(pkg) should already be at the top of this set
 				ofiles = append(
@@ -177,46 +184,75 @@ func Compile(pkg *Package, deps ...*Action) (*Action, error) {
 				err := pkg.tc.Pack(pkg, ofiles...)
 				pkg.Record("pack", time.Since(t0))
 				return err
-			}),
+			},
 		}
 		pack.Deps = append(pack.Deps, assemble...)
 		build = &pack
 	}
 
 	// should this package be cached
-	// TODO(dfc) pkg.SkipInstall should become Install
-	if !pkg.SkipInstall && pkg.Scope != "test" {
-		install := Action{
+	if pkg.Install && !pkg.TestScope {
+		build = &Action{
 			Name: fmt.Sprintf("install: %s", pkg.ImportPath),
-			Deps: []*Action{
-				build,
-			},
-			Task: TaskFn(func() error {
-				return copyfile(pkgfile(pkg), objfile(pkg))
-			}),
+			Deps: []*Action{build},
+			Run:  func() error { return fileutils.Copyfile(installpath(pkg), objfile(pkg)) },
 		}
-		build = &install
 	}
 
 	// if this is a main package, add a link stage
 	if pkg.isMain() {
-		link := Action{
+		build = &Action{
 			Name: fmt.Sprintf("link: %s", pkg.ImportPath),
 			Deps: []*Action{build},
-			Task: TaskFn(func() error {
-				return link(pkg)
-			}),
+			Run:  func() error { return link(pkg) },
 		}
-		build = &link
+	}
+	if !pkg.TestScope {
+		// if this package is not compiled in test scope, then
+		// log the name of the package when complete.
+		build.Run = logInfoFn(build.Run, pkg.ImportPath)
 	}
 	return build, nil
+}
+
+func logInfoFn(fn func() error, s string) func() error {
+	return func() error {
+		err := fn()
+		fmt.Println(s)
+		return err
+	}
 }
 
 // BuildDependencies returns a slice of Actions representing the steps required
 // to build all dependant packages of this package.
 func BuildDependencies(targets map[string]*Action, pkg *Package) ([]*Action, error) {
 	var deps []*Action
-	for _, i := range pkg.Imports() {
+	pkgs := pkg.Imports
+
+	var extra []string
+	switch {
+	case pkg.isMain():
+		// all binaries depend on runtime, even if they do not
+		// explicitly import it.
+		extra = append(extra, "runtime")
+		if pkg.race {
+			// race binaries have extra implicit depdendenceis.
+			extra = append(extra, "runtime/race")
+		}
+
+	case len(pkg.CgoFiles) > 0 && pkg.ImportPath != "runtime/cgo":
+		// anything that uses cgo has a dependency on runtime/cgo which is
+		// only visible after cgo file generation.
+		extra = append(extra, "runtime/cgo")
+	}
+	for _, i := range extra {
+		p, err := pkg.ResolvePackage(i)
+		if err != nil {
+			return nil, err
+		}
+		pkgs = append(pkgs, p)
+	}
+	for _, i := range pkgs {
 		a, err := BuildPackage(targets, i)
 		if err != nil {
 			return nil, err
@@ -232,13 +268,9 @@ func BuildDependencies(targets map[string]*Action, pkg *Package) ([]*Action, err
 
 func gc(pkg *Package, gofiles []string) error {
 	t0 := time.Now()
-	if pkg.Scope != "test" {
-		// only log compilation message if not in test scope
-		Infof(pkg.ImportPath)
-	}
 	includes := pkg.IncludePaths()
 	importpath := pkg.ImportPath
-	if pkg.Scope == "test" && pkg.ExtraIncludes != "" {
+	if pkg.TestScope && pkg.ExtraIncludes != "" {
 		// TODO(dfc) gross
 		includes = append([]string{pkg.ExtraIncludes}, includes...)
 	}
@@ -268,43 +300,53 @@ func link(pkg *Package) error {
 	}
 
 	includes := pkg.IncludePaths()
-	if pkg.Scope == "test" && pkg.ExtraIncludes != "" {
+	if pkg.TestScope && pkg.ExtraIncludes != "" {
 		// TODO(dfc) gross
 		includes = append([]string{pkg.ExtraIncludes}, includes...)
-		target += ".test"
 	}
 	err := pkg.tc.Ld(pkg, includes, target, objfile(pkg))
 	pkg.Record("link", time.Since(t0))
 	return err
 }
 
+// Workdir returns the working directory for a package.
+func Workdir(pkg *Package) string {
+	if pkg.TestScope {
+		ip := strings.TrimSuffix(filepath.FromSlash(pkg.ImportPath), "_test")
+		return filepath.Join(pkg.Workdir(), ip, "_test", filepath.Dir(filepath.FromSlash(pkg.ImportPath)))
+	}
+	return filepath.Join(pkg.Workdir(), filepath.Dir(filepath.FromSlash(pkg.ImportPath)))
+}
+
 // objfile returns the name of the object file for this package
 func objfile(pkg *Package) string {
-	return filepath.Join(pkg.Objdir(), objname(pkg))
+	return filepath.Join(Workdir(pkg), objname(pkg))
 }
 
 func objname(pkg *Package) string {
-	switch pkg.Name {
-	case "main":
+	if pkg.isMain() {
 		return filepath.Join(filepath.Base(filepath.FromSlash(pkg.ImportPath)), "main.a")
-	default:
-		return filepath.Base(filepath.FromSlash(pkg.ImportPath)) + ".a"
 	}
+	return filepath.Base(filepath.FromSlash(pkg.ImportPath)) + ".a"
 }
 
 func pkgname(pkg *Package) string {
-	if pkg.isMain() {
+	switch {
+	case pkg.TestScope:
 		return filepath.Base(filepath.FromSlash(pkg.ImportPath))
+	case pkg.Name == "main":
+		return filepath.Base(filepath.FromSlash(pkg.ImportPath))
+	default:
+		return pkg.Name
 	}
-	return pkg.Name
 }
 
 func binname(pkg *Package) string {
 	switch {
+	case pkg.TestScope:
+		return pkg.Name + ".test"
 	case pkg.Name == "main":
 		return filepath.Base(filepath.FromSlash(pkg.ImportPath))
-	case pkg.Scope == "test":
-		return pkg.Name
 	default:
 		panic("binname called with non main package: " + pkg.ImportPath)
 	}

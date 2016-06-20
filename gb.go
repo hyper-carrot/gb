@@ -5,13 +5,12 @@
 package gb
 
 import (
-	"fmt"
-	"io"
-	"io/ioutil"
+	"go/build"
 	"os"
 	"path/filepath"
-	"strings"
 )
+
+var releaseTags = build.Default.ReleaseTags
 
 // Toolchain represents a standardised set of command line tools
 // used to build and test Go programs.
@@ -59,104 +58,29 @@ type Action struct {
 	// Deps identifies the Actions that this Action depends.
 	Deps []*Action
 
-	// Task identifies the that this action represents.
-	Task
-}
-
-// Task represents some work to be performed. It contains a single method
-// Run, which is expected to be executed at most once.
-type Task interface {
-
-	// Run will initiate the work that this task represents and
-	// block until the work is complete.
-	Run() error
-}
-
-// TaskFn is a Task that can execute itself.
-type TaskFn func() error
-
-func (fn TaskFn) Run() error { return fn() }
-
-func mktmpdir() string {
-	d, err := ioutil.TempDir("", "gb")
-	if err != nil {
-		Fatalf("could not create temporary directory: %v", err)
-	}
-	return d
+	// Run identifies the task that this action represents.
+	Run func() error
 }
 
 func mkdir(path string) error {
 	return os.MkdirAll(path, 0755)
 }
 
-func copyfile(dst, src string) error {
-	err := mkdir(filepath.Dir(dst))
-	if err != nil {
-		return fmt.Errorf("copyfile: mkdirall: %v", err)
-	}
-	r, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("copyfile: open(%q): %v", src, err)
-	}
-	defer r.Close()
-	w, err := os.Create(dst)
-	if err != nil {
-		return fmt.Errorf("copyfile: create(%q): %v", dst, err)
-	}
-	defer w.Close()
-	Debugf("copyfile(dst: %v, src: %v)", dst, src)
-	_, err = io.Copy(w, r)
-	return err
-}
-
-// joinlist joins a []string representing path items
-// using the operating system specific list separator.
-func joinlist(l []string) string {
-	return strings.Join(l, string(filepath.ListSeparator))
-}
-
-func splitQuotedFields(s string) ([]string, error) {
-	// Split fields allowing '' or "" around elements.
-	// Quotes further inside the string do not count.
-	var f []string
-	for len(s) > 0 {
-		for len(s) > 0 && isWhitespace(s[0]) {
-			s = s[1:]
-		}
-		if len(s) == 0 {
-			break
-		}
-		// Accepted quoted string. No unescaping inside.
-		if s[0] == '"' || s[0] == '\'' {
-			quote := s[0]
-			s = s[1:]
-			i := 0
-			for i < len(s) && s[i] != quote {
-				i++
-			}
-			if i >= len(s) {
-				return nil, fmt.Errorf("unterminated %c string", quote)
-			}
-			f = append(f, s[:i])
-			s = s[i+1:]
-			continue
-		}
-		i := 0
-		for i < len(s) && !isWhitespace(s[i]) {
-			i++
-		}
-		f = append(f, s[:i])
-		s = s[i:]
-	}
-	return f, nil
-}
-
-func isWhitespace(c byte) bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
-}
-
 // stripext strips the extension from a filename.
 // The extension is defined by filepath.Ext.
 func stripext(path string) string {
 	return path[:len(path)-len(filepath.Ext(path))]
+}
+
+func relImportPath(root, path string) (string, error) {
+	if isRel(path) {
+		return filepath.Rel(root, path)
+	}
+	return path, nil
+}
+
+// isRel returns if an import path is relative or absolute.
+func isRel(path string) bool {
+	// TODO(dfc) should this be strings.StartsWith(".")
+	return path == "."
 }

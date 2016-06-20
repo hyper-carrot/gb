@@ -1,10 +1,10 @@
 package main
 
 import (
-	"fmt"
 	"os/exec"
 
 	"github.com/constabulary/gb/cmd"
+	"github.com/pkg/errors"
 )
 
 func init() {
@@ -23,7 +23,7 @@ gb plugins are executed from the parent gb process with the environment
 variable, GB_PROJECT_DIR set to the root of the current project.
 
 gb plugins can be executed directly but this is rarely useful, so authors
-should attempt to diagnose this by looking for the presence of the 
+should attempt to diagnose this by looking for the presence of the
 GB_PROJECT_DIR environment key.
 `,
 }
@@ -31,8 +31,5 @@ GB_PROJECT_DIR environment key.
 func lookupPlugin(arg string) (string, error) {
 	plugin := "gb-" + arg
 	path, err := exec.LookPath(plugin)
-	if err != nil {
-		return "", fmt.Errorf("plugin: unable to locate %q: %v", plugin, err)
-	}
-	return path, nil
+	return path, errors.Wrapf(err, "plugin: unable to locate %q", plugin)
 }

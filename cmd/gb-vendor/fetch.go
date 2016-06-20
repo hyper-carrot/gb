@@ -12,7 +12,9 @@ import (
 
 	"github.com/constabulary/gb"
 	"github.com/constabulary/gb/cmd"
-	"github.com/constabulary/gb/vendor"
+	"github.com/constabulary/gb/internal/fileutils"
+	"github.com/constabulary/gb/internal/vendor"
+	"github.com/pkg/errors"
 )
 
 var (
@@ -67,13 +69,13 @@ Flags:
 	Run: func(ctx *gb.Context, args []string) error {
 		switch len(args) {
 		case 0:
-			return fmt.Errorf("fetch: import path missing")
+			return errors.New("fetch: import path missing")
 		case 1:
 			path := args[0]
 			recurse = !noRecurse
 			return fetch(ctx, path, recurse)
 		default:
-			return fmt.Errorf("more than one import path supplied")
+			return errors.New("more than one import path supplied")
 		}
 	},
 	AddFlags: addFetchFlags,
@@ -82,7 +84,7 @@ Flags:
 func fetch(ctx *gb.Context, path string, recurse bool) error {
 	m, err := vendor.ReadManifest(manifestFile(ctx))
 	if err != nil {
-		return fmt.Errorf("could not load manifest: %v", err)
+		return errors.Wrap(err, "could not load manifest")
 	}
 
 	repo, extra, err := vendor.DeduceRemoteRepo(path, insecure)
@@ -95,17 +97,10 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 	path = stripscheme(path)
 
 	if m.HasImportpath(path) {
-		return fmt.Errorf("%s is already vendored", path)
+		return errors.Errorf("%s is already vendored", path)
 	}
 
-	var wc vendor.WorkingCopy
-
-	// if we are not recursing, then always fetch the HEAD of the master
-	if recurse {
-		wc, err = repo.Checkout(branch, tag, revision)
-	} else {
-		wc, err = repo.Checkout("", "", "")
-	}
+	wc, err := repo.Checkout(branch, tag, revision)
 
 	if err != nil {
 		return err
@@ -116,7 +111,7 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 		return err
 	}
 
-	branch, err := wc.Branch()
+	b, err := wc.Branch()
 	if err != nil {
 		return err
 	}
@@ -125,7 +120,7 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 		Importpath: path,
 		Repository: repo.URL(),
 		Revision:   rev,
-		Branch:     branch,
+		Branch:     b,
 		Path:       extra,
 	}
 
@@ -136,7 +131,7 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 	dst := filepath.Join(ctx.Projectdir(), "vendor", "src", dep.Importpath)
 	src := filepath.Join(wc.Dir(), dep.Path)
 
-	if err := vendor.Copypath(dst, src); err != nil {
+	if err := fileutils.Copypath(dst, src); err != nil {
 		return err
 	}
 
@@ -151,6 +146,12 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 	if !recurse {
 		return nil
 	}
+
+	// if we are recursing, overwrite branch, tag and revision
+	// values so recursive fetching checks out from HEAD.
+	branch = ""
+	tag = ""
+	revision = ""
 
 	for done := false; !done; {
 
@@ -175,7 +176,7 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 
 		is, ok := dsm[filepath.Join(ctx.Projectdir(), "vendor", "src", path)]
 		if !ok {
-			return fmt.Errorf("unable to locate depset for %q", path)
+			return errors.Errorf("unable to locate depset for %q", path)
 		}
 
 		missing := findMissing(pkgs(is.Pkgs), dsm)
@@ -189,7 +190,7 @@ func fetch(ctx *gb.Context, path string, recurse bool) error {
 			keys := keys(missing)
 			sort.Strings(keys)
 			pkg := keys[0]
-			gb.Infof("fetching recursive dependency %s", pkg)
+			fmt.Println("fetching recursive dependency", pkg)
 			if err := fetch(ctx, pkg, false); err != nil {
 				return err
 			}
